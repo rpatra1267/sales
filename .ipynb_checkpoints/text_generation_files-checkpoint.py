@@ -21,10 +21,7 @@ class Aem:
 
     def get_token(self):
         url = 'https://ims-na1.adobelogin.com/ims/exchange/jwt'
-        jwtPayloadRaw = """{ "iss": "39BFB008560A6FB87F000101@AdobeOrg",
-                     "sub": "E28F1E8067D31E450A495EEC@techacct.adobe.com",
-                     "https://ims-na1.adobelogin.com/s/ent_aem_cloud_api": true,
-                     "aud": "https://ims-na1.adobelogin.com/c/cm-p143511-e1511115-integration-0" }"""
+        jwtPayloadRaw = """placeholder"""
         jwtPayloadJson = json.loads(jwtPayloadRaw)
         jwtPayloadJson["exp"] = datetime.datetime.utcnow() + \
             datetime.timedelta(seconds=30)
