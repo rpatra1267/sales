@@ -1156,6 +1156,351 @@ class AEM_CPG:
                 json.dumps(result_medata.append(m_dict),ensure_ascii=False)
         return result_medata
 
+class AEM_DAM_SIM_MODULES:
+
+    def __init__(self, aem_instance, gcp_instance):
+        self.aem_instance = aem_instance
+        self.gcp_instance = gcp_instance
+        self.aem_base_url = self.aem_instance.config['aem_dam']['base_url']
+        self.filter_query = Template(self.aem_instance.config['aem_dam']['api_filter']).render(aem_url=self.aem_base_url)
+
+        # Authentication setup
+        self.client_id = gcp_instance.get_secret(self.aem_instance.config['gcp']['secret_manager']['aem_client_id'])
+        self.client_secret = gcp_instance.get_secret(self.aem_instance.config['gcp']['secret_manager']['aem_client_secret'])
+        self.private_key_path = self.aem_instance.config['aem_dam']['private_key_path']
+        self.sf_url = self.aem_base_url
+        
+        self.username = gcp_instance.get_secret(self.aem_instance.config['gcp']['secret_manager']['generic_account_aem_dam_username'])
+        if self.aem_instance.vault_available == "True":
+            self.password = HashiCorpVault(self.aem_instance.vault_namespace, self.username).get_password()
+        else:
+            self.password = gcp_instance.get_secret(self.aem_instance.config['gcp']['secret_manager']['generic_account_aem_dam_password'])
+        
+        # Get access token for AEM
+        self.access_token = self.get_token()
+
+    def get_token(self):
+        """
+        Get JWT token for AEM authentication
+        Modified from provided code to integrate with template structure
+        """
+        url = 'https://ims-na1.adobelogin.com/ims/exchange/jwt'
+        jwtPayloadRaw = """placeholder"""  # This should be replaced with actual JWT payload
+        jwtPayloadJson = json.loads(jwtPayloadRaw)
+        jwtPayloadJson["exp"] = datetime.utcnow() + datetime.timedelta(seconds=30)
+
+        accessTokenRequestPayload = {
+            'client_id': self.client_id, 
+            'client_secret': self.client_secret
+        }
+
+        keyfile = open(self.private_key_path, 'r')
+        private_key = keyfile.read()
+        keyfile.close()
+
+        jwttoken = jwt.encode(jwtPayloadJson, private_key, algorithm='RS256')
+        accessTokenRequestPayload['jwt_token'] = jwttoken
+        
+        result = requests.post(url, data=accessTokenRequestPayload, timeout=5)
+        resultjson = json.loads(result.text)
+        
+        return resultjson["access_token"]
+
+    @retry(delay=2, tries=3, backoff=2)
+    def generate_metadata_file(self, doc_info, search_profile, aem_folder, last_modified_date):
+        """
+        Extract the delta metadata from AEM API using SIM modules specific query
+        Modified from template to use get_doc_list method
+        Args:
+            doc_info (dict): dictionary to store metadata for doc_info table
+            search_profile (dict): dictionary to store metadata for search_profile table
+            aem_folder (str): AEM folder path
+            last_modified_date (str): Last modified date filter
+        Return:
+            Dictionaries with metadata extracted
+        """
+        
+        # Use the custom get_doc_list method instead of generic API call
+        date_to = datetime.utcnow().isoformat()
+        hits = self.get_doc_list(aem_folder, last_modified_date, date_to)
+        
+        if not hits:
+            return {}
+
+        # Convert hits to dataframe format similar to template
+        dataframe = pd.json_normalize(hits)
+        
+        # Remove duplicates based on document ID
+        df_filtered = dataframe.drop_duplicates(subset='jcr:content.mt:documentID', keep=False)
+        
+        data = json.loads(df_filtered.to_json(orient='records'))
+        for d in data:
+            doc_info['doc_info_metadata'].append(self.parse_metadata_result_doc_info(d, aem_folder))
+            search_profile['search_profile_metadata'].append(self.parse_metadata_result_search_profile(d))
+        
+        aem_data = {aem_d['jcr:content.mt:documentID']: aem_d for aem_d in data}
+        return aem_data
+
+    def get_doc_list(self, path, date_from, date_to):
+        """
+        Get document list from AEM using SIM modules specific query
+        Directly copied and modified from provided code
+        """
+        try:
+            headers = {"Authorization": f"Bearer {self.access_token}"}
+            url = f"{self.sf_url}/bin/querybuilder.json?path={path}/&type=dam:Asset&p.limit=-1&p.hits=full&p.nodedepth=2&1_property=jcr:content/cq:lastReplicationAction&2_daterange.property=jcr:content/cq:lastReplicated&2_daterange.lowerBound={date_from}&2_daterange.upperBound={date_to}"
+
+            response = requests.get(url, headers=headers)
+            data = response.json()
+            return data.get("hits", [])
+        except Exception as e:
+            print(f"Error while fetching AEM document list: {e}")
+            return []
+
+    def download_asset(self, url, doc_id):
+        """
+        Download asset and return as binary content for SIM modules
+        Modified from provided code to return binary content instead of saving to local file
+        """
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        response = requests.get(url, headers=headers)
+
+        if response.status_code == 200:
+            return response.content
+        else:
+            print(f"Error downloading the file from {url}")
+            return None
+
+    def create_sim_metadata_content(self, row):
+        """
+        Create SIM module specific metadata content as text binary
+        Based on the text file creation logic from provided code
+        """
+        try:
+            content_lines = []
+            content_lines.append(f"Path: {row.get('jcr:path', '')}")
+            content_lines.append(f"Created: {row.get('jcr:created', '')}")
+            content_lines.append(f"Uuid: {row.get('jcr:uuid', '')}")
+            content_lines.append(f"DocumentID: {row.get('jcr:content.mt:documentID', '')}")
+            content_lines.append(f"DocumentSupport: {row.get('jcr:content.mt:documentSupport', '')}")
+            content_lines.append(f"Names: {row.get('jcr:content.names', '')}")
+            content_lines.append(f"LastModified: {row.get('jcr:content.jcr:lastModified', '')}")
+            content_lines.append(f"Names-2: {row.get('jcr:content.names-2', '')}")
+            content_lines.append(f"Rba: {row.get('jcr:content.metadata.mt:rba', '')}")
+            content_lines.append(f"Description: {row.get('jcr:content.metadata.dc:description', '')}")
+            content_lines.append(f"ContentType: {row.get('jcr:content.metadata.mt:contentType', '')}")
+            content_lines.append(f"Title: {row.get('jcr:content.metadata.dc:title', '')}")
+
+            # Handle Content field similar to provided code
+            items = []
+            content_field = row.get('jcr:content.metadata.dam:Content', '')
+            if isinstance(content_field, str):
+                items = re.split(r"[,|\n]", content_field)
+            content_lines.append(f"Content: {items[:3]}")
+
+            # Join all lines and convert to binary
+            content_text = '\n'.join(content_lines)
+            return content_text.encode('utf-8')
+            
+        except Exception as e:
+            print(f"Error creating SIM metadata content: {e}")
+            return None
+
+    def parse_metadata_result_doc_info(self, metadata, aem_loc):
+        """
+        Parse the data and form a dictionary with values required for doc_info table
+        Customized for SIM modules based on provided code structure
+        Args:
+            metadata (dict): file properties metadata
+            aem_loc (str): AEM location
+        Return:
+            dictionary with keys as column names and values as column values for doc_info table
+        """
+        parser = SafeDictParser(metadata)
+        
+        # Extract file name using SIM modules specific logic - split by '/' and get last element
+        file_path = parser.parse('jcr:path')
+        file_name = remove_non_printable(file_path).split('/')[-1].replace('_', '-').replace('/', '-').replace('\r\n', '') if file_path else ''
+        
+        data = {
+            'doc_id': remove_non_printable(parser.parse('jcr:uuid')),  # Using jcr:uuid as doc_id like in new code
+            'doc_type': 'sim-model',  # Following new code's doc_type
+            'file_name': file_name,
+            'filesize_mb': '',
+            'author': remove_non_printable(str(parser.parse('jcr:createdBy')).replace("['", '').replace("']", '')),
+            'url': "https://www.micron.com" + remove_non_printable(parser.parse('jcr:path')),
+            'server_redirected_url': self.aem_base_url + parser.parse('jcr:path'),
+            'server_redirected_preview_url': "https://www.micron.com" + remove_non_printable(parser.parse('jcr:path')),
+            'file_type': 'txt',  # SIM modules create text content
+            'site_name': aem_loc,
+            'lifetime_views': '',
+            'recent_views': '',
+            'created_at': self.aem_instance.created_date,
+            'updated_at': self.aem_instance.updated_date,
+            'last_modified_time': remove_non_printable(parser.parse('jcr:created'))  # Using jcr:created like new code
+        }
+        return data
+
+    def parse_metadata_result_search_profile(self, metadata):
+        """
+        Parse the data and form a dictionary with values required for search_profile table
+        Customized for SIM modules
+        Args:
+            metadata (dict): file properties metadata
+        Return:
+            dictionary with keys as column names and values as column values for search_profile table
+        """
+        parser = SafeDictParser(metadata)
+        
+        # Extract file name using SIM modules specific logic - split by '/' and get last element
+        file_path = parser.parse('jcr:path')
+        file_name = remove_non_printable(file_path).split('/')[-1].replace('_', '-').replace('/', '-').replace('\r\n', '') if file_path else ''
+
+        data = {
+            'type_id': 0,
+            'doc_id': remove_non_printable(parser.parse('jcr:uuid')),  # Using jcr:uuid as doc_id like in new code
+            'doc_name': file_name,
+            'doc_url': "https://www.micron.com" + remove_non_printable(parser.parse('jcr:path')),
+            'last_modified_time': remove_non_printable(parser.parse('jcr:created')),  # Using jcr:created like new code
+            'created_at': self.aem_instance.created_date,
+            'updated_at': self.aem_instance.updated_date
+        }
+        return data
+
+    def process_metadata(self, rows, aem_data):
+        """
+        Processes the metadata file to support the Vertex AI Search API
+        Customized for SIM modules following the new processing logic
+        """
+        result_metadata = []
+
+        for row in rows:
+            if row['doc_id'] in aem_data:
+                data = aem_data[row['doc_id']]
+                parser = SafeDictParser(data)
+
+                # Baseline structure following new code pattern
+                test_clean_case = dict()
+                test_clean_case['id'] = remove_non_printable(parser.parse('jcr:uuid'))
+                test_clean_case['content'] = {
+                    "mimeType": "text/plain",  # SIM modules create text content
+                    "uri": "gs://" + self.aem_instance.private_bucket_name + '/' + self.aem_instance.document_folder + self.aem_instance.date + '/' + self.aem_instance.encode_file_name(row['file_name'], row['profile_id'])
+                }
+
+                # jsonData construction following new code logic
+                json_data = dict()
+
+                # Core metadata fields following new code structure
+                json_data['doc_type'] = 'sim-model'
+                json_data['file_name'] = remove_non_printable(parser.parse('jcr:path')).split('/')[-1].replace('_', '-').replace('/', '-').replace('\r\n', '') if parser.parse('jcr:path') else ''
+                json_data['file_name_keyprop'] = json_data['file_name']  # Same as file_name
+                json_data['url'] = 'https://www.micron.com' + remove_non_printable(parser.parse('jcr:path'))
+                json_data['pillar'] = "sales"
+                json_data['language'] = "{'English': 99.0}"
+                json_data['deleted'] = "no"
+                json_data['author'] = remove_non_printable(str(parser.parse('jcr:createdBy')).replace("['", '').replace("']", ''))
+                json_data['last_modified_time'] = remove_non_printable(parser.parse('jcr:created'))
+                json_data['last_modified_unix_time'] = int(row['last_modified_unix_time'])
+                json_data['last_modified_iso_time'] = datetime.fromtimestamp(int(row['last_modified_unix_time']), tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                json_data['title'] = remove_non_printable(parser.parse('jcr:content.names')).replace('_', '-').replace('/', '-').replace('\r\n', '') if parser.parse('jcr:content.names') else ''
+                json_data['file_type'] = row.get('file_type', 'txt')
+                json_data['doc_id'] = remove_non_printable(parser.parse('jcr:uuid'))
+
+                # Doc IDs for DPC following new code structure
+                json_data['aem_object_id'] = remove_non_printable(parser.parse('jcr:uuid'))
+                json_data['aem_uuid'] = remove_non_printable(parser.parse('jcr:uuid'))
+
+                # Doc category using rule_based_ner_data_source approach from new code
+                json_data['doc_category'] = parse_aem_doc_category(
+                    simplify_text(remove_non_printable(parser.parse('jcr:content.metadata.mt:contentType')).lower().replace(',', ' ').replace('-', ' ').replace('–', ' ').strip()) if parser.parse('jcr:content.metadata.mt:contentType') else '',
+                    json_data['url']
+                ).strip()
+
+                # Optional AEM metadata fields following new code logic
+                json_data['description'] = ' '.join([
+                    simplify_text(remove_non_printable(parser.parse('jcr:content.metadata.dc:description')).lower().replace(',', ' ').replace('-', ' ').replace('–', ' ').strip()) if parser.parse('jcr:content.metadata.dc:description') else '',
+                ]).strip()
+
+                # Subject field combining dc:title and first 100 chars of dam:Content like new code
+                dc_title = simplify_text(remove_non_printable(parser.parse('jcr:content.metadata.dc:title')).lower().replace(',', ' ').replace('-', ' ').replace('–', ' ').strip()) if parser.parse('jcr:content.metadata.dc:title') else ''
+                dam_content_100 = simplify_text(remove_non_printable(parser.parse('jcr:content.metadata.dam:Content'))[:100].lower().replace(',', ' ').replace('-', ' ').replace('–', ' ').strip()) if parser.parse('jcr:content.metadata.dam:Content') else ''
+                json_data['subject'] = ' '.join([dc_title, dam_content_100]).strip()
+
+                # Products field using chars 100:200 of dam:Content like new code
+                json_data['products'] = simplify_text(remove_non_printable(parser.parse('jcr:content.metadata.dam:Content'))[100:200].lower().replace(',', ' ').replace('-', ' ').replace('–', ' ').strip()) if parser.parse('jcr:content.metadata.dam:Content') else ''
+
+                # Optional text fields - empty as per new code
+                json_data['optional_text_field_1'] = ''
+                json_data['optional_text_field_2'] = ''
+                json_data['optional_text_field_3'] = ''
+                json_data['optional_text_field_4'] = ''
+                json_data['optional_text_field_5'] = ''
+
+                # NER metadata following new code structure exactly
+                json_data['business_unit_list'] = build_ner_data(parser.parse('jcr:content.metadata.mt:rba'), 'bu')
+                
+                # For all other NER fields, use the constructed fields as input like new code
+                ner_input_fields = [
+                    json_data['file_name'],
+                    json_data['url'],
+                    json_data['description'],
+                    json_data['subject'],
+                    json_data['products'],
+                    json_data['optional_text_field_1'],
+                    json_data['optional_text_field_2'],
+                    json_data['optional_text_field_3'],
+                    json_data['optional_text_field_4'],
+                    json_data['optional_text_field_5'],
+                ]
+
+                json_data['market_subsegment_list'] = build_ner_data(ner_input_fields, 'market_subsegment')
+                json_data['mpn_list'] = build_ner_data(ner_input_fields, 'mpn')
+                json_data['design_id_list'] = build_ner_data(ner_input_fields, 'design_id')
+                json_data['functional_technology_list'] = build_ner_data(ner_input_fields, 'functional_technology')
+                json_data['package_type_list'] = build_ner_data(ner_input_fields, 'package_type')
+                json_data['density_list'] = build_ner_data(ner_input_fields, 'density')
+                json_data['product_series_list'] = build_ner_data(ner_input_fields, 'product_series')
+                json_data['process_requirement_list'] = build_ner_data(ner_input_fields, 'process_requirement')
+
+                # Final cleanup and structure following template pattern
+                if json_data['title'].lower() == "none" or not json_data['title']:
+                    json_data['title'] = json_data['file_name']
+
+                m_dict = {
+                    "id": "doc-" + str(row['profile_id']),
+                    "jsonData": json.dumps(json_data),
+                    "content": test_clean_case['content']
+                }
+
+                result_metadata.append(m_dict)
+
+        return result_metadata
+
+    def extract_dam_content(self, content_field):
+        """
+        Extract first 3 items from dam:Content field similar to provided code
+        """
+        items = []
+        if isinstance(content_field, str):
+            items = re.split(r"[,|\n]", content_field)
+        return str(items[:3])
+
+    def callback_trigger(self, operation):
+        """
+        Callback function to log Datastore ingestion results.
+        Copied directly from template code
+        """
+        global datastore_processed
+        global data_extraction_ingestion_job_map
+        out = datastore_callback(operation)
+        batch_insert_status, datastore_failure_insert_status = log_datastore_results(out, data_extraction_ingestion_job_map, self)
+        if batch_insert_status and datastore_failure_insert_status:
+            datastore_processed += 1
+        else:
+            logger.error(f"Unable to update {self.genie_data_store_batch_history_table} table or {self.genie_error_log_table}")
+
+        logger.info(f"Processed Requests: {datastore_processed}")
+
 def main():
     """
     The main entry point of the script
@@ -1217,6 +1562,8 @@ def main():
                     aem_type_instance = AEM_DAM(aem_instance,gcp_utils_instance)
                 elif source_type == 'aem-cpg':
                     aem_type_instance = AEM_CPG(aem_instance,gcp_utils_instance)
+                elif source_type == 'aem-dam-sim-modules':
+                    aem_type_instance = AEM_DAM_SIM_MODULES(aem_instance,gcp_utils_instance
 
                 aem_data = aem_type_instance.generate_metadata_file(doc_info,search_profile, aem_location, res.last_time_flag[0])
                 logger.info("Number of New Documents Found in location %s : %s", aem_location, len(doc_info['doc_info_metadata']))
